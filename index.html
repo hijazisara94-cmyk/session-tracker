@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Google Docs session tracker — Quilltrack prototype</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="theme-color" content="#5b4bd6">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Session tracker">
+<style>
+  :root { --bg:#faf8f5; --card:#fff; --ink:#222; --muted:#6b6b6b; --line:#e4dfd8; --accent:#5b4bd6; --ok:#2e7d4f; --warn:#b5651d; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; background:var(--bg); color:var(--ink); }
+  main { max-width:640px; margin:0 auto; padding:24px 16px 64px; }
+  h1 { font-size:1.35rem; margin:0 0 4px; }
+  .sub { color:var(--muted); margin:0 0 20px; font-size:.95rem; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:14px; }
+  .card h2 { font-size:1rem; margin:0 0 10px; }
+  label { display:block; font-size:.9rem; color:var(--muted); margin:10px 0 4px; }
+  input, select { width:100%; padding:10px; border:1px solid var(--line); border-radius:8px; font:inherit; background:#fff; }
+  button { font:inherit; padding:12px 18px; border-radius:10px; border:1px solid var(--line); background:#fff; cursor:pointer; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  .big { flex:1; min-width:140px; padding:16px; font-size:1.05rem; font-weight:600; }
+  .status { font-size:.95rem; }
+  .status.ok { color:var(--ok); } .status.warn { color:var(--warn); }
+  pre { background:#f4f1ec; border-radius:8px; padding:12px; overflow:auto; font-size:.82rem; margin:8px 0 0; white-space:pre-wrap; }
+  #log { max-height:220px; overflow:auto; font-size:.82rem; color:var(--muted); }
+  .note { font-size:.85rem; color:var(--muted); margin-top:8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Google Docs session tracker</h1>
+  <p class="sub">Prototype for Quilltrack. Your text stays between Google and this device; only the numbers below leave it.</p>
+
+  <section class="card">
+    <h2>1. Connect</h2>
+    <div id="clientIdBox">
+      <label for="clientIdInput">Google client ID (from your Google Cloud project — only needed once)</label>
+      <input id="clientIdInput" placeholder="1234…-abc.apps.googleusercontent.com" autocomplete="off">
+      <p class="note">This app's address, for the Google setup: <strong id="originText"></strong></p>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button id="connectBtn" class="primary">Connect Google Docs</button>
+      <span id="connectStatus" class="status">Not connected</span>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>2. Settings <span class="note">(saved in your own Drive, shared by all your devices)</span></h2>
+    <label for="folderInput">Writing folder (paste its Google Drive link)</label>
+    <input id="folderInput" placeholder="https://drive.google.com/drive/folders/…">
+    <label for="inactivitySelect">Close the session automatically after</label>
+    <select id="inactivitySelect">
+      <option value="0">Never (I'll tap End myself)</option>
+      <option value="10">10 minutes without edits</option>
+      <option value="15">15 minutes without edits</option>
+      <option value="20">20 minutes without edits</option>
+      <option value="30">30 minutes without edits</option>
+      <option value="45">45 minutes without edits</option>
+      <option value="60">60 minutes without edits</option>
+    </select>
+    <label for="endpointInput">Quilltrack endpoint to receive results (optional, for testing)</label>
+    <input id="endpointInput" placeholder="https://… (leave empty to just show the result here)">
+    <div class="row" style="margin-top:12px">
+      <button id="saveBtn" disabled>Save settings</button>
+      <span id="folderStatus" class="status"></span>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>3. Session</h2>
+    <div class="row">
+      <button id="startBtn" class="big primary" disabled>Start session</button>
+      <button id="endBtn" class="big" disabled>End session</button>
+    </div>
+    <p id="sessionStatus" class="status note">Connect and choose a folder first.</p>
+  </section>
+
+  <section class="card">
+    <h2>What Quilltrack receives</h2>
+    <pre id="result">Nothing yet.</pre>
+  </section>
+
+  <section class="card">
+    <h2>Activity</h2>
+    <div id="log"></div>
+  </section>
+</main>
+
+<script src="tracker-core.js"></script>
+<script src="https://accounts.google.com/gsi/client" async defer onload="window.gisReady && window.gisReady()"></script>
+<script>
+'use strict';
+
+/* ====== CONFIG — your OAuth client ID (see README). You can also paste it into the app. ====== */
+const DEFAULT_CLIENT_ID = 'YOUR_CLIENT_ID.apps.googleusercontent.com';
+/* ============================================================================================ */
+const validClientId = id => /^[\w-]+\.apps\.googleusercontent\.com$/.test(id || '') && !/^YOUR_CLIENT_ID/.test(id);
+function savedClientId() { try { return localStorage.getItem('qt_client_id'); } catch (e) { return null; } }
+let CLIENT_ID = validClientId(DEFAULT_CLIENT_ID) ? DEFAULT_CLIENT_ID : (savedClientId() || '');
+let gisLoaded = false;
+
+// drive.readonly: list the folder and read the docs.  drive.appdata: the hidden per-app storage in the user's Drive.
+const SCOPES = 'https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.appdata';
+const SESSION_FILE = 'session.json';
+const SETTINGS_FILE = 'settings.json';
+const AUTO_CHECK_MS = 60 * 1000;
+
+const $ = id => document.getElementById(id);
+let tokenClient = null, accessToken = null, tokenExpiresAt = 0, pendingToken = null;
+let settings = { folderId: '', inactivityMinutes: 0, endpoint: '' };
+let session = null;          // the snapshot, while a session is running
+let autoTimer = null, busy = false;
+
+/* ---------- small UI helpers ---------- */
+function log(msg) {
+  const line = document.createElement('div');
+  line.textContent = new Date().toLocaleTimeString() + '  ' + msg;
+  $('log').prepend(line);
+}
+function setStatus(el, text, kind) { el.textContent = text; el.className = 'status' + (kind ? ' ' + kind : '') + (el.id === 'sessionStatus' ? ' note' : ''); }
+function refreshButtons() {
+  const ready = !!accessToken && !!settings.folderId;
+  $('saveBtn').disabled = !accessToken || busy;
+  $('startBtn').disabled = !ready || !!session || busy;
+  $('endBtn').disabled = !ready || !session || busy;
+}
+
+/* ---------- sign-in (Google Identity Services) ---------- */
+window.gisReady = () => { gisLoaded = true; if (validClientId(CLIENT_ID)) initTokenClient(); };
+
+function initTokenClient() {
+  tokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: CLIENT_ID,
+    scope: SCOPES,
+    callback: resp => {
+      if (resp.error) { pendingToken && pendingToken.reject(new Error(resp.error)); pendingToken = null; return; }
+      accessToken = resp.access_token;
+      tokenExpiresAt = Date.now() + (resp.expires_in - 60) * 1000;
+      pendingToken && pendingToken.resolve(accessToken); pendingToken = null;
+    },
+    error_callback: err => {   // popup closed or blocked
+      pendingToken && pendingToken.reject(new Error(err.message || err.type || 'Sign-in cancelled'));
+      pendingToken = null;
+    }
+  });
+}
+
+function getToken(interactive) {
+  if (accessToken && Date.now() < tokenExpiresAt) return Promise.resolve(accessToken);
+  if (!tokenClient) return Promise.reject(new Error('Google sign-in has not loaded yet.'));
+  // Background checks can't open Google's sign-in popup, so they stop here and wait for the next tap.
+  if (!interactive) return Promise.reject(new Error(accessToken ? 'Sign-in expired; tap Connect again.' : 'Not connected.'));
+  return new Promise((resolve, reject) => {
+    pendingToken = { resolve, reject };
+    tokenClient.requestAccessToken({ prompt: accessToken ? '' : 'consent' });
+  });
+}
+
+/* ---------- Google API helpers ---------- */
+async function api(url, options = {}, attempt = 0) {
+  const token = await getToken(true);
+  const res = await fetch(url, { ...options, headers: { ...(options.headers || {}), Authorization: 'Bearer ' + token } });
+  if ((res.status === 429 || res.status >= 500) && attempt < 4) {
+    await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));   // Google rate limit: back off and retry
+    return api(url, options, attempt + 1);
+  }
+  if (!res.ok) throw new Error(`Google API ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  return res;
+}
+
+async function listDocsInFolder(folderId) {
+  const q = encodeURIComponent(`'${folderId}' in parents and mimeType='application/vnd.google-apps.document' and trashed=false`);
+  let pageToken = '', files = [];
+  do {
+    const res = await api(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=nextPageToken,files(id,name,modifiedTime)&pageSize=1000` +
+                          (pageToken ? `&pageToken=${pageToken}` : ''));
+    const data = await res.json();
+    files = files.concat(data.files || []);
+    pageToken = data.nextPageToken || '';
+  } while (pageToken);
+  return files;   // direct children only: subfolders are ignored
+}
+
+async function mainTextOf(docId) {
+  const res = await api(`https://docs.googleapis.com/v1/documents/${docId}?includeTabsContent=true`);
+  return TrackerCore.mainTextOfDocument(await res.json());
+}
+
+/** Run async jobs with limited parallelism. */
+async function inBatches(items, size, fn) {
+  const out = [];
+  for (let i = 0; i < items.length; i += size) out.push(...await Promise.all(items.slice(i, i + size).map(fn)));
+  return out;
+}
+
+/* ---------- hidden app storage in the user's own Drive ---------- */
+async function findAppFile(name) {
+  const q = encodeURIComponent(`name='${name}'`);
+  const res = await api(`https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=${q}&fields=files(id)`);
+  const files = (await res.json()).files || [];
+  return files.length ? files[0].id : null;
+}
+async function readAppFile(name) {
+  const id = await findAppFile(name);
+  if (!id) return null;
+  return (await api(`https://www.googleapis.com/drive/v3/files/${id}?alt=media`)).json();
+}
+async function writeAppFile(name, obj) {
+  const body = JSON.stringify(obj);
+  const id = await findAppFile(name);
+  if (id) {
+    await api(`https://www.googleapis.com/upload/drive/v3/files/${id}?uploadType=media`,
+              { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body });
+    return;
+  }
+  const boundary = 'b' + Math.random().toString(36).slice(2);
+  const multipart = `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n` +
+    JSON.stringify({ name, parents: ['appDataFolder'] }) +
+    `\r\n--${boundary}\r\nContent-Type: application/json\r\n\r\n${body}\r\n--${boundary}--`;
+  await api('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',
+            { method: 'POST', headers: { 'Content-Type': 'multipart/related; boundary=' + boundary }, body: multipart });
+}
+async function deleteAppFile(name) {
+  const id = await findAppFile(name);
+  if (id) await api(`https://www.googleapis.com/drive/v3/files/${id}`, { method: 'DELETE' });
+}
+
+/* ---------- connect & settings ---------- */
+$('connectBtn').onclick = async () => {
+  try {
+    if (!tokenClient) {
+      const typed = $('clientIdInput').value.trim();
+      if (!validClientId(typed)) throw new Error('Paste your Google client ID first (it ends in .apps.googleusercontent.com).');
+      if (!gisLoaded) throw new Error('Google sign-in is still loading. Try again in a moment.');
+      CLIENT_ID = typed;
+      try { localStorage.setItem('qt_client_id', typed); } catch (e) { /* storage unavailable: ask again next time */ }
+      initTokenClient();
+    }
+    await getToken(true);
+    $('clientIdBox').hidden = true;
+    setStatus($('connectStatus'), 'Connected', 'ok');
+    log('Connected to Google.');
+    const saved = await readAppFile(SETTINGS_FILE);
+    if (saved) {
+      settings = { ...settings, ...saved };
+      $('folderInput').value = settings.folderId ? 'https://drive.google.com/drive/folders/' + settings.folderId : '';
+      $('inactivitySelect').value = String(settings.inactivityMinutes || 0);
+      $('endpointInput').value = settings.endpoint || '';
+      setStatus($('folderStatus'), 'Settings loaded from your Drive.', 'ok');
+    }
+    session = await readAppFile(SESSION_FILE);   // a session started on another device shows up here
+    if (session) {
+      showRunning();
+      log('Found a running session started ' + new Date(session.startedAt).toLocaleString() + '.');
+      await autoCloseCheck();
+    } else {
+      setStatus($('sessionStatus'), settings.folderId ? 'Ready.' : 'Choose a folder first.');
+    }
+    scheduleAutoCheck();
+  } catch (e) { setStatus($('connectStatus'), e.message, 'warn'); log('Connect failed: ' + e.message); }
+  refreshButtons();
+};
+
+$('saveBtn').onclick = async () => {
+  const raw = $('folderInput').value.trim();
+  const m = raw.match(/folders\/([\w-]+)/) || raw.match(/^([\w-]{20,})$/);
+  if (!m) { setStatus($('folderStatus'), 'That doesn’t look like a folder link.', 'warn'); return; }
+  busy = true; refreshButtons();
+  try {
+    const docs = await listDocsInFolder(m[1]);
+    settings = { folderId: m[1], inactivityMinutes: Number($('inactivitySelect').value), endpoint: $('endpointInput').value.trim() };
+    await writeAppFile(SETTINGS_FILE, settings);
+    setStatus($('folderStatus'), `Saved. ${docs.length} doc(s) in this folder will be tracked.`, 'ok');
+    if (!session) setStatus($('sessionStatus'), 'Ready.');
+    log('Settings saved.');
+    scheduleAutoCheck();
+  } catch (e) { setStatus($('folderStatus'), e.message, 'warn'); }
+  busy = false; refreshButtons();
+};
+
+/* ---------- Start ---------- */
+$('startBtn').onclick = async () => {
+  busy = true; refreshButtons();
+  setStatus($('sessionStatus'), 'Starting…');
+  try {
+    const startedAt = new Date().toISOString();
+    const files = await listDocsInFolder(settings.folderId);
+    const texts = await inBatches(files, 4, f => mainTextOf(f.id));
+    const docs = {};
+    files.forEach((f, i) => { docs[f.id] = { name: f.name, modifiedTime: f.modifiedTime, text: texts[i] }; });
+    session = { sessionId: 's-' + Date.now(), startedAt, folderId: settings.folderId, docs };
+    await writeAppFile(SESSION_FILE, session);              // stored in the user's Drive, not on a server
+    log(`Session started. Snapshot of ${files.length} doc(s) saved to your Drive.`);
+    showRunning();
+    scheduleAutoCheck();
+  } catch (e) { session = null; setStatus($('sessionStatus'), 'Could not start: ' + e.message, 'warn'); }
+  busy = false; refreshButtons();
+};
+
+function showRunning() {
+  const auto = settings.inactivityMinutes ? ` Closes after ${settings.inactivityMinutes} min without edits.` : '';
+  setStatus($('sessionStatus'), 'Session running since ' + new Date(session.startedAt).toLocaleTimeString() + '.' + auto, 'ok');
+}
+
+/* ---------- End (by the user or by inactivity) ---------- */
+$('endBtn').onclick = () => endSession('user', new Date());
+
+async function endSession(closedBy, endedAt) {
+  if (!session || busy) return;
+  busy = true; refreshButtons();
+  setStatus($('sessionStatus'), 'Ending…');
+  try {
+    const files = await listDocsInFolder(session.folderId);
+    const endDocs = {};
+    const edited = files.filter(f => !session.docs[f.id] || new Date(f.modifiedTime) > new Date(session.docs[f.id].modifiedTime));
+    const texts = await inBatches(edited, 4, f => mainTextOf(f.id));   // only edited docs are downloaded
+    files.forEach(f => { endDocs[f.id] = { name: f.name, modifiedTime: f.modifiedTime }; });
+    edited.forEach((f, i) => { endDocs[f.id].text = texts[i]; });
+
+    const result = TrackerCore.buildSessionResult(session, endDocs, endedAt, closedBy);
+    $('result').textContent = JSON.stringify(result, null, 2);
+    log(`Session ended (${closedBy === 'user' ? 'by you' : 'after inactivity'}): +${result.wordsAdded} / −${result.wordsRemoved} words.`);
+
+    if (settings.endpoint) {
+      const res = await fetch(settings.endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(result) });
+      log(`Sent to Quilltrack endpoint: HTTP ${res.status}.`);
+    }
+    await deleteAppFile(SESSION_FILE);                       // snapshot no longer needed
+    session = null;
+    setStatus($('sessionStatus'), 'Session logged. Ready for the next one.', 'ok');
+  } catch (e) {
+    setStatus($('sessionStatus'), 'Could not end the session: ' + e.message + ' (your snapshot is kept; try again)', 'warn');
+  }
+  busy = false; refreshButtons();
+}
+
+/* ---------- app setup ---------- */
+$('originText').textContent = location.origin;
+if (validClientId(CLIENT_ID)) $('clientIdInput').value = CLIENT_ID;
+if ('serviceWorker' in navigator && location.protocol === 'https:') {
+  navigator.serviceWorker.register('sw.js').catch(() => {});   // lets the tablet install it as an app
+}
+
+/* ---------- optional auto-close ---------- */
+function scheduleAutoCheck() {
+  clearInterval(autoTimer);
+  if (settings.inactivityMinutes > 0) autoTimer = setInterval(autoCloseCheck, AUTO_CHECK_MS);
+}
+
+async function autoCloseCheck() {
+  if (!session || busy || !settings.inactivityMinutes) return;
+  try {
+    await getToken(false);
+    const files = await listDocsInFolder(session.folderId);   // metadata only: no text is downloaded here
+    const meta = {};
+    files.forEach(f => { meta[f.id] = { modifiedTime: f.modifiedTime }; });
+    const last = TrackerCore.lastEditTime(session, meta);
+    if (TrackerCore.shouldAutoClose(last, new Date(), settings.inactivityMinutes)) {
+      log(`No edits for ${settings.inactivityMinutes} min: closing the session at your last edit (${last.toLocaleTimeString()}).`);
+      await endSession('inactivity', last);
+    }
+  } catch (e) { log('Auto-close check skipped: ' + e.message); }
+}
+</script>
+</body>
+</html>
